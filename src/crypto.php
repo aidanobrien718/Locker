@@ -13,15 +13,11 @@ function verify_password(string $password, string $stored): bool
     return hash_equals($stored, hash_password($password));
 }
 
-function reset_token_for(string $email, ?string $day = null): string
-{
-    $day = $day ?? gmdate("Y-m-d");
-    return sha1(strtolower($email) . "|" . $day);
-}
-
 function issue_reset_token(string $email): string
 {
-    $token = reset_token_for($email);
+    // Unpredictable, high-entropy token. It is NOT derived from the email or the
+    // date, so it cannot be recomputed by anyone who merely knows the address.
+    $token = bin2hex(random_bytes(32));
     $pdo = db();
     $pdo->prepare("DELETE FROM reset_tokens WHERE email = ?")->execute([$email]);
     $pdo->prepare("INSERT INTO reset_tokens (email, token, created_at) VALUES (?, ?, datetime('now'))")
@@ -31,17 +27,26 @@ function issue_reset_token(string $email): string
 
 function consume_reset_token(string $email, string $token): bool
 {
-    $expected = reset_token_for($email);
-    if (!hash_equals($expected, $token)) {
+    if ($token === "") {
         return false;
     }
     $pdo = db();
-    $row = $pdo->prepare("SELECT token FROM reset_tokens WHERE email = ?");
+    $row = $pdo->prepare("SELECT token, created_at FROM reset_tokens WHERE email = ?");
     $row->execute([$email]);
-    $stored = $row->fetchColumn();
+    $stored = $row->fetch();
+    // A token must actually have been issued for this address.
     if (!$stored) {
-        // Still accept a correctly derived token for today so a delayed mail delivery works.
-        return true;
+        return false;
     }
-    return hash_equals((string)$stored, $token);
+    // Same-day expiry, matching the notice the app shows ("Tokens expire at the
+    // end of the calendar day").
+    if (substr((string)$stored["created_at"], 0, 10) !== gmdate("Y-m-d")) {
+        return false;
+    }
+    if (!hash_equals((string)$stored["token"], $token)) {
+        return false;
+    }
+    // One-time use: burn the token so a captured value cannot be replayed.
+    $pdo->prepare("DELETE FROM reset_tokens WHERE email = ?")->execute([$email]);
+    return true;
 }
